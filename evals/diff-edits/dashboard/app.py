@@ -331,6 +331,42 @@ def get_performance_grade(success_rate):
     else:
         return "C", "poor"
 
+def get_error_description(error_enum, error_string=None):
+    """Map error enum values to user-friendly descriptions"""
+    error_map = {
+        1: "No tool calls - Model didn't use the replace_in_file tool",
+        2: "Multiple tool calls - Model called multiple tools instead of one", 
+        3: "Wrong tool call - Model used wrong tool (not replace_in_file)",
+        4: "Missing parameters - Tool call missing required path or diff",
+        5: "Wrong file edited - Model edited different file than expected",
+        6: "Wrong tool call - Model used wrong tool type",
+        7: "Wrong file edited - Model targeted incorrect file path",
+        8: "API/Stream error - Problem with model API connection",
+        9: "Configuration error - Invalid evaluation parameters",
+        10: "Function error - Invalid parsing/diff functions",
+        11: "Other error - Unexpected failure"
+    }
+    
+    base_description = error_map.get(error_enum, f"Unknown error (code: {error_enum})")
+    
+    if error_string:
+        return f"{base_description}: {error_string}"
+    return base_description
+
+def get_error_guidance(error_enum):
+    """Provide specific guidance based on error type"""
+    guidance_map = {
+        1: "💡 The model provided a response but didn't use the replace_in_file tool. Check the raw output to see what the model actually said.",
+        2: "💡 The model called multiple tools when it should only call replace_in_file once. Check the parsed tool call section.",
+        3: "💡 The model used a different tool instead of replace_in_file. This might indicate confusion about the task.",
+        4: "💡 The model called replace_in_file but didn't provide the required 'path' or 'diff' parameters.",
+        5: "💡 The model tried to edit a different file than expected. Check the parsed tool call to see which file it targeted.",
+        6: "💡 The model used the wrong tool type. Check the raw output to see what tool it attempted to use.",
+        7: "💡 The model tried to edit a different file path than expected. This could indicate path confusion or hallucination.",
+    }
+    
+    return guidance_map.get(error_enum, "")
+
 def render_hero_section(current_run, model_performance):
     """Render the hero section with key metrics"""
     run_title = current_run['description'] if current_run['description'] else f"Run {current_run['run_id'][:8]}..."
@@ -420,21 +456,33 @@ def render_model_comparison_cards(model_performance):
                 metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
                 
                 with metric_col1:
-                    st.metric("Avg Latency", f"{model['avg_round_trip_ms']:.0f}ms")
+                    if pd.notna(model['avg_round_trip_ms']):
+                        st.metric("Avg Latency", f"{model['avg_round_trip_ms']:.0f}ms")
+                    else:
+                        st.metric("Avg Latency", "N/A")
                 
                 with metric_col2:
-                    st.metric("Avg Cost", f"${model['avg_cost']:.4f}")
+                    if pd.notna(model['avg_cost']):
+                        st.metric("Avg Cost", f"${model['avg_cost']:.4f}")
+                    else:
+                        st.metric("Avg Cost", "N/A")
                 
                 with metric_col3:
                     st.metric("Valid Results", f"{model['total_results']}")
                 
                 with metric_col4:
-                    st.metric("First Token", f"{model['avg_first_token_ms']:.0f}ms")
+                    if pd.notna(model['avg_first_token_ms']):
+                        st.metric("First Token", f"{model['avg_first_token_ms']:.0f}ms")
+                    else:
+                        st.metric("First Token", "N/A")
             
             with col2:
                 st.write("")  # Add some spacing
                 if st.button(f"Drill Down", key=f"drill_{model['model_id']}", use_container_width=True):
                     st.session_state.drill_down_model = model['model_id']
+                    # Update URL with model_id for drill down
+                    st.query_params["model_id"] = model['model_id']
+                    st.rerun()
             
             st.divider()  # Add a divider between models
 
@@ -558,12 +606,16 @@ def render_result_detail(result):
     """Render detailed view of a single result"""
     st.markdown("### 🔬 Result Deep Dive")
     
-    # Check if this is a valid result
-    is_valid = (result['error_enum'] not in [1, 6, 7]) if not pd.isna(result['error_enum']) else True
+    # Check if this is a valid result (only invalid if no tool calls or wrong file)
+    is_valid = True
+    if not pd.isna(result['error_enum']):
+        # Only these specific errors make a result "invalid" for the benchmark:
+        # 1 = no_tool_calls, 5 = wrong_file_edited, 7 = wrong_file_edited
+        is_valid = result['error_enum'] not in [1, 5, 7]
     
     # Show validity warning if needed
     if not is_valid:
-        st.warning("⚠️ **This is an invalid result** - The model didn't properly call the diff edit tool or edited the wrong file. This result is excluded from success rate calculations.")
+        st.warning("⚠️ **This is an invalid result** - The model didn't call the replace_in_file tool or edited the wrong file. This result is excluded from success rate calculations.")
     
     # Result metadata
     col1, col2, col3, col4 = st.columns(4)
@@ -579,7 +631,10 @@ def render_result_detail(result):
         st.markdown(f"**Round Trip:** {result['time_round_trip_ms']:.0f}ms")
     
     with col4:
-        st.markdown(f"**Cost:** ${result['cost_usd']:.4f}")
+        if pd.notna(result['cost_usd']) and result['cost_usd'] is not None:
+            st.markdown(f"**Cost:** ${result['cost_usd']:.4f}")
+        else:
+            st.markdown(f"**Cost:** Free")
     
     # Tabbed interface for different views
     tab1, tab2, tab3, tab4 = st.tabs(["📄 File & Edits", "🤖 Raw Output", "🔧 Parsed Tool Call", "📊 Metrics"])
@@ -681,8 +736,46 @@ def render_file_and_edits_view(result):
             # Show error information
             st.error("❌ **Edit Failed**")
             
+            # Show detailed error reason
             if not pd.isna(result['error_enum']):
-                st.markdown(f"**Error Code:** {result['error_enum']}")
+                error_description = get_error_description(
+                    result['error_enum'], 
+                    result.get('error_string')
+                )
+                st.markdown(f"**Reason:** {error_description}")
+                
+                # Show specific guidance based on error type
+                guidance = get_error_guidance(result['error_enum'])
+                if guidance:
+                    st.info(guidance)
+            
+            # For valid results that failed, check for diff application failures
+            elif not result['succeeded']:
+                # This is a valid result that failed - likely due to diff application issues
+                raw_output = result.get('raw_model_output', '')
+                
+                # Check if we have specific error information in the raw output
+                if 'does not match anything in the file' in str(raw_output).lower():
+                    st.warning("⚠️ **Diff Application Failed**")
+                    st.info("💡 The SEARCH block in the diff didn't match any content in the original file. This usually means the model hallucinated code that doesn't exist.")
+                elif 'malformatted' in str(raw_output).lower() or 'malformed' in str(raw_output).lower():
+                    st.warning("⚠️ **Diff Format Error**")
+                    st.info("💡 The diff format was incorrect. Check the raw tool call to see the formatting issues.")
+                elif 'error:' in str(raw_output).lower():
+                    # Try to extract the specific error message
+                    lines = str(raw_output).split('\n')
+                    error_lines = [line for line in lines if 'error:' in line.lower()]
+                    if error_lines:
+                        error_msg = error_lines[0].strip()
+                        st.warning("⚠️ **Diff Application Failed**")
+                        st.info(f"💡 {error_msg}")
+                    else:
+                        st.warning("⚠️ **Diff Application Failed**")
+                        st.info("💡 The diff couldn't be applied to the original file. Check the raw output and parsed tool call for more details.")
+                else:
+                    # Generic diff application failure
+                    st.warning("⚠️ **Diff Application Failed**")
+                    st.info("💡 The model made a valid tool call but the diff couldn't be applied to the original file. This usually indicates a mismatch between the expected and actual file content.")
         else:
             # Show successful edit information
             st.success("✅ **Edit Successful**")
@@ -713,8 +806,25 @@ def render_file_and_edits_view(result):
                     if len(edited_lines) > 50:
                         st.text(f"... ({len(edited_lines) - 50} more lines)")
         
-        # Show parsed tool call if available
+        # Show raw and parsed tool calls if available
         if not pd.isna(result['parsed_tool_call_json']):
+            with st.expander("View Raw Tool Call"):
+                # Extract the raw tool call text from the model output
+                raw_output = result['raw_model_output'] if not pd.isna(result['raw_model_output']) else ""
+                
+                # Try to extract just the tool call portion
+                if raw_output and '<replace_in_file>' in raw_output:
+                    # Find the tool call block
+                    start_idx = raw_output.find('<replace_in_file>')
+                    end_idx = raw_output.find('</replace_in_file>') + len('</replace_in_file>')
+                    if start_idx != -1 and end_idx != -1:
+                        raw_tool_call = raw_output[start_idx:end_idx]
+                        st.code(raw_tool_call, language='xml')
+                    else:
+                        st.text("Tool call not found in raw output")
+                else:
+                    st.text("No raw tool call available")
+            
             with st.expander("View Parsed Tool Call"):
                 try:
                     parsed_call = json.loads(result['parsed_tool_call_json'])
@@ -783,8 +893,10 @@ def render_metrics_view(result):
         if not pd.isna(result['completion_tokens']):
             st.metric("Completion Tokens", int(result['completion_tokens']))
         
-        if not pd.isna(result['cost_usd']):
+        if pd.notna(result['cost_usd']) and result['cost_usd'] is not None:
             st.metric("Cost", f"${result['cost_usd']:.4f}")
+        else:
+            st.metric("Cost", "Free")
         
         if not pd.isna(result['tokens_in_context']):
             st.metric("Context Tokens", int(result['tokens_in_context']))
@@ -835,12 +947,29 @@ def main():
     if 'selected_run_id' not in st.session_state:
         st.session_state.selected_run_id = None
     
+    # Handle URL parameters for direct linking
+    query_params = st.query_params
+    url_run_id = query_params.get("run_id")
+    url_model_id = query_params.get("model_id")
+    
     # Load all runs for sidebar
     all_runs = load_all_runs()
     
     if all_runs.empty:
         st.error("No evaluation runs found in the database.")
         st.stop()
+    
+    # Set initial run selection from URL or default to latest
+    if url_run_id and url_run_id in all_runs['run_id'].values:
+        if st.session_state.selected_run_id != url_run_id:
+            st.session_state.selected_run_id = url_run_id
+            st.session_state.drill_down_model = None  # Reset drill down when changing runs via URL
+    elif st.session_state.selected_run_id is None:
+        st.session_state.selected_run_id = all_runs.iloc[0]['run_id']  # Default to latest
+    
+    # Set drill down model from URL
+    if url_model_id and st.session_state.selected_run_id == url_run_id:
+        st.session_state.drill_down_model = url_model_id
     
     # Sidebar for run selection
     with st.sidebar:
@@ -887,6 +1016,10 @@ def main():
         if run_ids[selected_run_idx] != st.session_state.selected_run_id:
             st.session_state.selected_run_id = run_ids[selected_run_idx]
             st.session_state.drill_down_model = None  # Reset drill down when changing runs
+            # Update URL with new run_id
+            st.query_params["run_id"] = st.session_state.selected_run_id
+            if "model_id" in st.query_params:
+                del st.query_params["model_id"]  # Clear model_id when changing runs
             st.rerun()
         
         # Show run details in sidebar
@@ -897,6 +1030,67 @@ def main():
         st.markdown(f"**Created:** {selected_run['created_at']}")
         if selected_run['description']:
             st.markdown(f"**Description:** {selected_run['description']}")
+        
+        # Show shareable URL
+        st.markdown("---")
+        st.markdown("### 🔗 Share This View")
+        
+        # Build current URL
+        # Dynamically derive the base URL
+        try:
+            # For older Streamlit versions
+            server_address = st.server.server_address
+            server_port = st.server.server_port
+        except AttributeError:
+            # Fallback for newer Streamlit versions where st.server is removed
+            # We can't reliably get the server address/port from within the script anymore.
+            # We'll default to localhost and the default port.
+            # The user can see the correct network URL in the terminal.
+            server_address = "localhost"
+            server_port = 8501
+        
+        base_url = f"http://{server_address}:{server_port}"
+        current_url = f"{base_url}/?run_id={st.session_state.selected_run_id}"
+        if st.session_state.drill_down_model:
+            current_url += f"&model_id={st.session_state.drill_down_model}"
+        
+        st.markdown("**Current URL:**")
+        st.code(current_url, language=None)
+        
+        # Copy button using HTML/JS
+        copy_button_html = f"""
+        <button onclick="copyToClipboard('{current_url}')" style="
+            padding: 8px 16px; 
+            border-radius: 5px; 
+            border: 1px solid #ccc; 
+            background: #f0f2f6;
+            cursor: pointer;
+            font-size: 14px;
+            margin-top: 5px;
+        ">📋 Copy Link</button>
+        <script>
+            function copyToClipboard(text) {{
+                navigator.clipboard.writeText(text).then(function() {{
+                    // Success feedback
+                    event.target.innerText = '✅ Copied!';
+                    event.target.style.backgroundColor = '#d4edda';
+                    setTimeout(() => {{ 
+                        event.target.innerText = '📋 Copy Link'; 
+                        event.target.style.backgroundColor = '#f0f2f6';
+                    }}, 2000);
+                }}, function(err) {{
+                    // Error feedback
+                    event.target.innerText = '❌ Failed';
+                    event.target.style.backgroundColor = '#f8d7da';
+                    setTimeout(() => {{ 
+                        event.target.innerText = '📋 Copy Link'; 
+                        event.target.style.backgroundColor = '#f0f2f6';
+                    }}, 2000);
+                }});
+            }}
+        </script>
+        """
+        st.components.v1.html(copy_button_html, height=50)
     
     # Load data for selected run
     current_run, model_performance = load_run_comparison(st.session_state.selected_run_id)
@@ -914,6 +1108,9 @@ def main():
         with col1:
             if st.button("Back to Overview", use_container_width=True):
                 st.session_state.drill_down_model = None
+                # Clear model_id from URL when going back to overview
+                if "model_id" in st.query_params:
+                    del st.query_params["model_id"]
                 st.rerun()
         
         render_detailed_analysis(current_run['run_id'], st.session_state.drill_down_model)
